@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>D-Day 스마트 플래너 (카카오 연동)</title>
+    <!-- Kakao SDK -->
+    <script src="https://developers.kakao.com/sdk/js/kakao.min.js"></script>
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Firebase SDK (v9) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-app.js";
+        import { getFirestore, collection, addDoc, getDocs, deleteDoc, doc, updateDoc, query, where } from "https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore.js";
+
+        // Firebase 설정값 (본인 설정값)
+        const firebaseConfig = {
+            apiKey: "AIzaSyCEUmcAMmfQSwt5Pz06GgjcxqFe7dL3lWo",
+            authDomain: "dailyplanner-df6d8.firebaseapp.com",
+            projectId: "dailyplanner-df6d8",
+            storageBucket: "dailyplanner-df6d8.firebasestorage.app",
+            messagingSenderId: "402401353427",
+            appId: "1:402401353427:web:71d8bdf5aa3eb4118bfe26",
+            measurementId: "G-H3ZH7TW3PR"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // Kakao SDK 초기화
+        Kakao.init('d369d7df212efbd176d4142c85f7f1b0');
+
+        let currentKakaoUser = null;
+        let currentNickname = '플래너';
+        let schedules = [];
+        let currentFilter = '전체';
+
+        // 카카오 로그인 (nickname 읽기 에러 완벽 방어 처리)
+        window.loginWithKakao = () => {
+            Kakao.Auth.login({
+                success: function(authObj) {
+                    Kakao.API.request({
+                        url: '/v2/user/me',
+                        success: async function(res) {
+                            currentKakaoUser = res;
+                            
+                            // 닉네임 추출 시 null/undefined 에러 방어 구문
+                            let extractedNick = '플래너';
+                            if (res && res.properties && res.properties.nickname) {
+                                extractedNick = res.properties.nickname;
+                            } else if (res && res.kakao_account && res.kakao_account.profile && res.kakao_account.profile.nickname) {
+                                extractedNick = res.kakao_account.profile.nickname;
+                            }
+
+                            const savedNick = (res && res.id) ? localStorage.getItem(`nick_${res.id}`) : null;
+                            currentNickname = savedNick || extractedNick;
+
+                            document.getElementById('auth-section').style.display = 'none';
+                            document.getElementById('main-content').style.display = 'block';
+                            updateUserProfileUI();
+                            await loadSchedules();
+                        },
+                        fail: function(error) {
+                            alert('사용자 정보 요청 실패: ' + JSON.stringify(error));
+                        }
+                    });
+                },
+                fail: function(err) {
+                    alert('카카오 로그인 실패: ' + JSON.stringify(err));
+                }
+            });
+        };
+
+        // 닉네임 변경 기능
+        window.editNickname = () => {
+            if (!currentKakaoUser) return;
+            const newNick = prompt('변경할 닉네임을 입력하세요:', currentNickname);
+            if (newNick && newNick.trim()) {
+                currentNickname = newNick.trim();
+                localStorage.setItem(`nick_${currentKakaoUser.id}`, currentNickname);
+                updateUserProfileUI();
+            }
+        };
+
+        function updateUserProfileUI() {
+            document.getElementById('user-profile').innerHTML = `
+                <span><strong>${currentNickname}</strong>님 환영합니다!</span>
+                <button onclick="editNickname()" class="btn-edit-nick" title="닉네임 변경"><i class="fa-solid fa-pen"></i> 수정</button>
+            `;
+        }
+
+        // 로그아웃
+        window.logout = () => {
+            if (Kakao.Auth.getAccessToken()) {
+                Kakao.Auth.logout(function() {
+                    currentKakaoUser = null;
+                    schedules = [];
+                    document.getElementById('auth-section').style.display = 'block';
+                    document.getElementById('main-content').style.display = 'none';
+                    alert('로그아웃 되었습니다.');
+                });
+            }
+        };
+
+        // 로그인된 사용자 일정 불러오기
+        async function loadSchedules() {
+            if (!currentKakaoUser || !currentKakaoUser.id) return;
+            const kakaoId = String(currentKakaoUser.id);
+            const q = query(collection(db, "schedules"), where("kakaoUserId", "==", kakaoId));
+            const querySnapshot = await getDocs(q);
+            schedules = [];
+            querySnapshot.forEach((docSnap) => {
+                schedules.push({ id: docSnap.id, ...docSnap.data() });
+            });
+            renderSchedules();
+        }
+
+        // 일정 추가
+        window.addSchedule = async () => {
+            const titleInput = document.getElementById('title');
+            const dateInput = document.getElementById('date');
+            const categoryInput = document.getElementById('category');
+
+            const title = titleInput.value.trim();
+            const date = dateInput.value;
+            const category = categoryInput.value;
+
+            if (!title || !date) {
+                alert('일정 이름과 날짜를 입력해주세요.');
+                return;
+            }
+
+            try {
+                const kakaoId = String(currentKakaoUser.id);
+                const docRef = await addDoc(collection(db, "schedules"), {
+                    kakaoUserId: kakaoId,
+                    title,
+                    date,
+                    category,
+                    createdAt: new Date()
+                });
+                schedules.push({ id: docRef.id, kakaoUserId: kakaoId, title, date, category });
+                renderSchedules();
+
+                titleInput.value = '';
+                dateInput.value = '';
+            } catch (e) {
+                alert("일정 저장 실패: " + e.message);
+            }
+        };
+
+        // 일정 삭제
+        window.deleteSchedule = async (id) => {
+            if (confirm('정말 이 일정을 삭제하시겠습니까?')) {
+                await deleteDoc(doc(db, "schedules", id));
+                schedules = schedules.filter(s => s.id !== id);
+                renderSchedules();
+            }
+        };
+
+        // 일정 수정
+        window.editSchedule = async (id) => {
+            const schedule = schedules.find(s => s.id === id);
+            if (!schedule) return;
+
+            const newTitle = prompt('수정할 일정 이름:', schedule.title);
+            if (!newTitle) return;
+
+            const newDate = prompt('수정할 날짜 (YYYY-MM-DD):', schedule.date);
+            if (!newDate) return;
+
+            await updateDoc(doc(db, "schedules", id), {
+                title: newTitle.trim(),
+                date: newDate.trim()
+            });
+
+            schedule.title = newTitle.trim();
+            schedule.date = newDate.trim();
+            renderSchedules();
+        };
+
+        // D-Day 계산
+        function getDDay(targetDate) {
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const target = new Date(targetDate);
+            target.setHours(0, 0, 0, 0);
+
+            const diffTime = target - today;
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+            if (diffDays === 0) return { text: 'D-Day', days: 0 };
+            if (diffDays > 0) return { text: `D-${diffDays}`, days: diffDays };
+            return { text: `D+${Math.abs(diffDays)}`, days: diffDays };
+        }
+
+        // 필터링
+        window.filterSchedules = (category) => {
+            currentFilter = category;
+            document.querySelectorAll('.btn-filter').forEach(btn => {
+                btn.classList.toggle('active', btn.innerText === category);
+            });
+            renderSchedules();
+        };
+
+        // 일정 목록 출력
+        function renderSchedules() {
+            const list = document.getElementById('schedule-list');
+            const searchQuery = document.getElementById('search') ? document.getElementById('search').value.toLowerCase() : '';
+            const sortOption = document.getElementById('sort-select') ? document.getElementById('sort-select').value : 'dday-asc';
+            list.innerHTML = '';
+
+            let filtered = currentFilter === '전체' 
+                ? [...schedules] 
+                : schedules.filter(s => s.category === currentFilter);
+
+            if (searchQuery) {
+                filtered = filtered.filter(s => s.title.toLowerCase().includes(searchQuery));
+            }
+
+            // 정렬
+            filtered.sort((a, b) => {
+                if (sortOption === 'dday-asc') {
+                    return new Date(a.date) - new Date(b.date);
+                } else if (sortOption === 'dday-desc') {
+                    return new Date(b.date) - new Date(a.date);
+                } else if (sortOption === 'title-asc') {
+                    return a.title.localeCompare(b.title);
+                } else if (sortOption === 'category') {
+                    return a.category.localeCompare(b.category);
+                }
+            });
+
+            if (filtered.length === 0) {
+                list.innerHTML = `
+                    <div class="empty-state">
+                        <i class="fa-regular fa-folder-open"></i>
+                        <p>등록된 일정이 없습니다.</p>
+                    </div>
+                `;
+                return;
+            }
+
+            filtered.forEach(s => {
+                const ddayObj = getDDay(s.date);
+                const isImminent = ddayObj.days >= 0 && ddayObj.days <= 3;
+                
+                const li = document.createElement('li');
+                li.className = `schedule-item category-${s.category}`;
+                li.innerHTML = `
+                    <div class="schedule-info">
+                        <div class="schedule-header">
+                            <span class="badge">${s.category}</span>
+                            <span class="schedule-title">${s.title}</span>
+                        </div>
+                        <div class="schedule-date"><i class="fa-regular fa-clock"></i> ${s.date}</div>
+                    </div>
+                    <div class="schedule-right">
+                        <div class="dday-tag ${isImminent ? 'imminent' : ''}">${ddayObj.text}</div>
+                        <div class="item-actions">
+                            <button class="btn-icon" onclick="editSchedule('${s.id}')" title="수정">
+                                <i class="fa-solid fa-pen"></i>
+                            </button>
+                            <button class="btn-icon delete" onclick="deleteSchedule('${s.id}')" title="삭제">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                `;
+                list.appendChild(li);
+            });
+        }
+
+        window.renderSchedules = renderSchedules;
+
+        // 카카오톡 무작위 브리핑 전송
+        window.sendPeriodBriefing = () => {
+            if (schedules.length === 0) {
+                alert('전송할 일정이 없습니다.');
+                return;
+            }
+
+            const cheerMessages = [
+                "끝까지 포기하지 말고 힘내세요! 🔥",
+                "오늘의 노력이 내일의 멋진 결실로 이어질 거예요! ✨",
+                "차근차근 해내다 보면 어느새 목표 달성! 🎯",
+                "지칠 땐 잠시 쉬어가도 괜찮아요. 항상 응원합니다! 🌿",
+                "당신은 충분히 잘하고 있어요! 파이팅! 💪",
+                "막막해 보여도 한 걸음씩 나아가 봅시다! 🚀",
+                "오늘 하루도 알차고 보람있게 마무리해봐요! ⭐",
+                "목표를 향해 한 걸음 더 가까워졌네요! 🏆"
+            ];
+
+            const randomCheer = cheerMessages[Math.floor(Math.random() * cheerMessages.length)];
+            let messageText = `📅 [${currentNickname}]님의 D-Day 브리핑\n\n`;
+
+            const sortedSchedules = [...schedules].sort((a, b) => new Date(a.date) - new Date(b.date));
+            sortedSchedules.forEach(s => {
+                const ddayObj = getDDay(s.date);
+                messageText += `• [${s.category}] ${s.title}: ${ddayObj.text} (${s.date})\n`;
+            });
+
+            messageText += `\n${randomCheer}`;
+
+            Kakao.API.request({
+                url: '/v2/api/talk/memo/default/send',
+                data: {
+                    template_object: {
+                        object_type: 'text',
+                        text: messageText,
+                        link: {
+                            web_url: window.location.href,
+                            mobile_web_url: window.location.href
+                        }
+                    }
+                },
+                success: function() {
+                    alert('카카오톡으로 D-Day 브리핑이 전송되었습니다!');
+                },
+                fail: function(error) {
+                    alert('메시지 전송 실패: ' + JSON.stringify(error));
+                }
+            });
+        };
+    </script>
+
+    <style>
+        :root {
+            --primary-color: #4a90e2;
+            --primary-hover: #357abd;
+            --kakao-color: #fee500;
+            --kakao-hover: #e6cf00;
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #333333;
+            --text-muted: #6c757d;
+            --border-radius: 12px;
+            --shadow: 0 4px 6px rgba(0, 0, 0, 0.07);
+            --transition: all 0.3s ease;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: 'Pretendard', sans-serif; background-color: var(--bg-color); color: var(--text-color); line-height: 1.6; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: var(--card-bg); padding: 30px; border-radius: var(--border-radius); box-shadow: var(--shadow); }
+        header { text-align: center; margin-bottom: 30px; }
+        header h1 { font-size: 2rem; color: #2c3e50; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+        .card { background: #ffffff; border: 1px solid #e9ecef; border-radius: var(--border-radius); padding: 20px; margin-bottom: 25px; }
+        .card-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 15px; color: #2c3e50; display: flex; align-items: center; gap: 8px; }
+        .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 15px; }
+        .input-group { display: flex; flex-direction: column; gap: 6px; }
+        .input-group label { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); }
+        input[type="text"], input[type="date"], select { width: 100%; padding: 10px 12px; border: 1px solid #ced4da; border-radius: 6px; font-size: 0.95rem; }
+        .btn { padding: 10px 18px; border: none; border-radius: 6px; font-weight: 600; font-size: 0.95rem; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px; }
+        .btn-primary { background-color: var(--primary-color); color: white; width: 100%; }
+        .btn-kakao-login { background-color: var(--kakao-color); color: #3c1e1e; width: 100%; padding: 12px; font-size: 1.05rem; }
+        .btn-kakao-login:hover { background-color: var(--kakao-hover); }
+        .btn-kakao-send { background-color: #3c1e1e; color: #ffffff; width: 100%; }
+        .controls-bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+        .filter-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+        .btn-filter { background: #e9ecef; color: #495057; padding: 6px 12px; font-size: 0.85rem; border-radius: 20px; border: none; cursor: pointer; }
+        .btn-filter.active { background: var(--primary-color); color: white; }
+        .controls-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1; justify-content: flex-end; }
+        .sort-select { width: auto; min-width: 140px; padding: 6px 10px; font-size: 0.85rem; }
+        .search-box { position: relative; min-width: 160px; }
+        .search-box input { padding-left: 32px; font-size: 0.85rem; }
+        .search-box i { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); color: var(--text-muted); }
+        .schedule-list { list-style: none; display: flex; flex-direction: column; gap: 12px; }
+        .schedule-item { background: #ffffff; border: 1px solid #e9ecef; border-left: 5px solid var(--primary-color); border-radius: 8px; padding: 16px; display: flex; justify-content: space-between; align-items: center; }
+        .schedule-item.category-시험 { border-left-color: #ff6b6b; }
+        .schedule-item.category-과제 { border-left-color: #fcc419; }
+        .schedule-item.category-개인 { border-left-color: #51cf66; }
+        .schedule-info { display: flex; flex-direction: column; gap: 4px; }
+        .schedule-header { display: flex; align-items: center; gap: 8px; }
+        .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 12px; font-weight: 600; background: #e9ecef; color: #495057; }
+        .schedule-title { font-weight: 600; font-size: 1.05rem; }
+        .schedule-date { font-size: 0.85rem; color: var(--text-muted); }
+        .schedule-right { display: flex; align-items: center; gap: 15px; }
+        .dday-tag { font-size: 1.2rem; font-weight: 700; color: var(--primary-color); }
+        .dday-tag.imminent { color: #ff6b6b; }
+        .item-actions { display: flex; gap: 6px; }
+        .btn-icon { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 6px; border-radius: 4px; }
+        .btn-icon.delete:hover { color: #ff6b6b; }
+        .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); }
+        .user-bar { display: flex; justify-content: space-between; align-items: center; background: #f1f3f5; padding: 12px 18px; border-radius: 8px; margin-bottom: 20px; }
+        .btn-edit-nick { background: none; border: none; color: #4a90e2; cursor: pointer; font-size: 0.8rem; margin-left: 6px; text-decoration: underline; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1><i class="fa-regular fa-calendar-check"></i> D-Day 스마트 플래너</h1>
+        <p>카카오 로그인으로 나만의 일정을 안전하게 관리하세요.</p>
+    </header>
+
+    <!-- 로그인 전 화면 -->
+    <div id="auth-section" class="card" style="text-align: center;">
+        <h2 style="margin-bottom: 10px;">서비스 이용을 위해 로그인해주세요</h2>
+        <p style="margin-bottom: 20px; color: var(--text-muted);">카카오 계정으로 로그인하면 어떤 기기에서든 내 일정을 확인할 수 있습니다.</p>
+        <button class="btn btn-kakao-login" onclick="loginWithKakao()">
+            <i class="fa-solid fa-comment"></i> 카카오 계정으로 시작하기
+        </button>
+    </div>
+
+    <!-- 로그인 후 메인 화면 -->
+    <div id="main-content" style="display: none;">
+        <div class="user-bar">
+            <div id="user-profile"></div>
+            <button class="btn" onclick="logout()" style="background: #dc3545; color: white; padding: 6px 12px; font-size: 0.85rem;">로그아웃</button>
+        </div>
+
+        <!-- 일정 등록 카드 -->
+        <div class="card">
+            <div class="card-title">
+                <i class="fa-solid fa-plus-circle"></i> 새 일정 등록
+            </div>
+            <div class="form-grid">
+                <div class="input-group">
+                    <label for="title">일정 이름</label>
+                    <input type="text" id="title" placeholder="예: 중간고사, 자격증 시험">
+                </div>
+                <div class="input-group">
+                    <label for="date">날짜</label>
+                    <input type="date" id="date">
+                </div>
+                <div class="input-group">
+                    <label for="category">유형</label>
+                    <select id="category">
+                        <option value="시험">시험</option>
+                        <option value="과제">과제</option>
+                        <option value="개인">개인</option>
+                    </select>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="addSchedule()">
+                <i class="fa-solid fa-check"></i> 일정 추가하기
+            </button>
+        </div>
+
+        <!-- 카카오톡 알림 카드 -->
+        <div class="card">
+            <div class="card-title">
+                <i class="fa-solid fa-paper-plane"></i> 카카오톡 알림
+            </div>
+            <button class="btn btn-kakao-send" onclick="sendPeriodBriefing()">
+                <i class="fa-solid fa-comment"></i> 나에게 오늘 D-Day 카톡 보내기
+            </button>
+        </div>
+
+        <!-- 일정 목록 컨트롤 영역 -->
+        <div class="controls-bar">
+            <div class="filter-buttons">
+                <button class="btn btn-filter active" onclick="filterSchedules('전체')">전체</button>
+                <button class="btn btn-filter" onclick="filterSchedules('시험')">시험</button>
+                <button class="btn btn-filter" onclick="filterSchedules('과제')">과제</button>
+                <button class="btn btn-filter" onclick="filterSchedules('개인')">개인</button>
+            </div>
+            <div class="controls-right">
+                <select id="sort-select" class="sort-select" onchange="renderSchedules()">
+                    <option value="dday-asc">⏳ 마감일 임박순</option>
+                    <option value="dday-desc">📅 마감일 먼 순</option>
+                    <option value="title-asc">🔤 이름순</option>
+                    <option value="category">🏷️ 유형별</option>
+                </select>
+                <div class="search-box">
+                    <i class="fa-solid fa-magnifying-glass"></i>
+                    <input type="text" id="search" placeholder="일정 검색..." oninput="renderSchedules()">
+                </div>
+            </div>
+        </div>
+
+        <ul id="schedule-list" class="schedule-list"></ul>
+    </div>
+</div>
+
+</body>
+</html>
